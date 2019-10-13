@@ -5,7 +5,6 @@ import os
 from random import random
 import time
 import typing as ty
-from types import SimpleNamespace
 
 import psutil
 import numpy as np
@@ -49,14 +48,17 @@ class Task:
 
 
 @export
-class TaskGenerator(SimpleNamespace):
+class TaskGenerator:
     dtypes: ty.Tuple[str]       # Produced data types
-    wants_input: ty.Tuple[ty.Tuple[str, int]]
+    wants_input: ty.List[ty.List[str, int]]
                                 # [(dtype, chunk_i), ...] of inputs
                                 # needed to make progress
     is_source = False           # True if loader/producer of data without deps
     submit_to = 'thread'        # thread, process, or user
     parallel = False            # Can we start more than one task at a time?
+    input_delivery = 'direct'   # 'direct' = inputs are argument to task
+                                # 'separate': call new_input with inputs
+                                #   in main thread. Cannot parallelize.
 
     priority = 0                # 0 = saver/target, 1 = source, 2 = other
     depth = 0                   # Dependency hops to final target
@@ -69,21 +71,18 @@ class TaskGenerator(SimpleNamespace):
     has_final_task = False
     has_finished = False
 
-    def task_function(self, chunk_i: int, **kwargs) -> ty.Dict[str: np.ndarray]:
-        """Function executing the task"""
-        raise NotImplementedError
+    def __init__(self):
+        if self.input_delivery != 'direct' and not self.parallel:
+            raise RuntimeError("Cannot parallelize a TaskGenerator with "
+                               "indirect input delivery.")
 
     def __repr__(self):
-        return f"TaskGenerator[{self.dtypes[0]}]"
-
-    def inputs_exhausted(self):
-        return False
-
-    def is_ready(self):
-        return True
-
-    def finish(self):
-        pass
+        _from = _to = ''
+        if len(self.wants_input):
+            _from = self.wants_input[0][0]
+        if len(self.dtypes):
+            _to = self.dtypes[0]
+        return f"TaskGenerator[{_from}>{_to}]"
 
     def task(self, inputs) -> Task:
         self.chunk_i += 1
@@ -91,6 +90,7 @@ class TaskGenerator(SimpleNamespace):
         assert not self.has_finished
         if not self.parallel:
             self.need_result_chunk = self.chunk_i
+            self.deliver_inputs(**inputs)
 
         if self.is_source:
             assert inputs is None, "Passed inputs to source"
@@ -98,17 +98,45 @@ class TaskGenerator(SimpleNamespace):
         else:
             assert all([k in self.wants_input for k in inputs]), "unwanted input"
             assert all([k in inputs for k in self.wants_input]), "missing input"
-            task_f = partial(self.task_function, chunk_i=self.chunk_i, **inputs)
+            if self.input_delivery == 'direct':
+                task_f = partial(self.task_function,
+                                 chunk_i=self.chunk_i,
+                                 **inputs)
+                self.wants_input = [[dt, i + 1] for dt, i in self.wants_input]
+            else:
+                self.receive_inputs(chunk_i=self.chunk_i, **inputs)
+                task_f = partial(self.task_function, chunk_i=self.chunk_i)
         return Task(content=task_f,
                     generator=self,
                     chunk_i=self.chunk_i,
                     is_final=False)
+
+    def external_inputs_exhausted(self):
+        """For sources, return whether external inputs exhausted"""
+        return False
+
+    def external_input_ready(self):
+        """For sources, return whether the next external input
+         (i.e. self.chunk_id + 1) is ready"""
+        return True
+
+    def finish(self):
+        pass
+
+    def receive_inputs(self, **inputs):
+        """For indirect input delivery: receive inputs and update want_inputs"""
+        pass
 
     def final_task(self) -> Task:
         raise NotImplementedError
 
     def finish_on_exception(self, exception):
         self.finish()
+
+    def task_function(self, chunk_i: int, is_final=False, **kwargs)\
+            -> ty.Dict[str: np.ndarray]:
+        """Function executing the task"""
+        raise NotImplementedError
 
 
 class StoredData:
@@ -225,9 +253,11 @@ class Scheduler:
         external_waits = []    # TaskGenerators waiting for external conditions
         sources = []           # Sources we could load more data from
         requests_for = defaultdict(int)  # Requests for particular inputs
+        exhausted_inputs = sum([list(tg.dtypes) for tg in self.task_generators],
+                               [])
 
         for tg in self.task_generators:
-            if not tg.is_ready():
+            if not tg.external_input_ready():
                 external_waits.append(tg)
                 continue
             if not tg.parallel and (
@@ -235,11 +265,14 @@ class Scheduler:
                     < tg.need_result_chunk):
                 continue        # Need previous task to finish first
             if tg.is_source:
+                # Handle these separately (at the end) regardless of priority
                 sources.append(tg)
                 continue
 
             # Are the required inputs available?
-            if tg.inputs_exhausted():
+            if ((not tg.is_source or tg.external_inputs_exhausted())
+                    and all([dt in exhausted_inputs for dt in tg.dtypes])):
+                # Inputs are exhausted
                 if not tg.has_finished:
                     if tg.has_final_task:
                         return tg.final_task()   # Submit final task (no inputs)
