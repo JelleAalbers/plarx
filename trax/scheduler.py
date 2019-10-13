@@ -10,6 +10,9 @@ from types import SimpleNamespace
 import psutil
 import numpy as np
 
+from .utils import exporter
+export, __all__ = exporter()
+
 
 class Task:
     """Task object, tracking a future submitted to a pool
@@ -45,6 +48,7 @@ class Task:
         return f"{self.generator.dtypes[0]}:{self.chunk_i}"
 
 
+@export
 class TaskGenerator(SimpleNamespace):
     dtypes: ty.Tuple[str]       # Produced data types
     wants_input: ty.Tuple[ty.Tuple[str, int]]
@@ -125,6 +129,7 @@ class StoredData:
                                   for tg in wanted_by}
 
 
+@export
 class Scheduler:
     pending_tasks: ty.List[Task]
     stored_data: ty.Dict[str, StoredData]  # {dtypename: StoredData}
