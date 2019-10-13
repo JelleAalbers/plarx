@@ -10,11 +10,11 @@ with open('README.md') as file:
 with open('HISTORY.md') as file:
     history = file.read()
 
-setuptools.setup(name='trax',
-                 version='0.3.1',
+setuptools.setup(name='plarx',
+                 version='0.0.0',
                  description='Push numpy arrays through plugins',
                  author='Jelle Aalbers',
-                 url='https://github.com/JelleAalbers/trax',
+                 url='https://github.com/JelleAalbers/plarx',
                  long_description=readme + '\n\n' + history,
                  long_description_content_type="text/markdown",
                  setup_requires=['pytest-runner'],
