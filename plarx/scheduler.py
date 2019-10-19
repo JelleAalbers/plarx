@@ -224,7 +224,6 @@ class StoredData:
                                 # that need it
     last_contiguous = -1        # Latest chunk that has arrived
                                 # for which all previous chunks have arrived
-    source_exhausted = False    # Whether source will produce more data
 
     def __init__(self, dtype, wanted_by: ty.List[TaskGenerator]):
         self.dtype = dtype
@@ -485,6 +484,3 @@ class Scheduler:
             t.future.cancel()
         self.threadpool.shutdown()
         self.processpool.shutdown()
-
-    def all_exhausted(self):
-        raise NotImplementedError

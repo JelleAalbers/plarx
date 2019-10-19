@@ -1,6 +1,3 @@
-import typing as ty
-import time
-
 import numpy as np
 
 import plarx
@@ -21,6 +18,7 @@ class BasicSource(plarx.TaskGenerator):
     def task_function(self, chunk_i, is_final=False, **kwargs):
         print(f"Source task {chunk_i} running. self.chunk_i is {self.chunk_i}")
         return dict(widgets=np.ones(42, dtype=np.float32) * chunk_i)
+
 
 def test_source():
     """Single source, no processing"""
@@ -79,7 +77,6 @@ class FunnyCombination(plarx.TaskGenerator):
         if is_final:
             return None
         self.toggle = not self.toggle
-        print
         if self.toggle:
             # Request only widgets next time
             return (
