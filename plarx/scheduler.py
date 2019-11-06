@@ -47,6 +47,10 @@ class Task:
         return f"{self.generator}:{self.chunk_i}"
 
 
+class CannotSubmitNewTask(Exception):
+    pass
+
+
 @export
 class TaskGenerator:
     provides: ty.Tuple[str] = tuple()     # Produced data types
@@ -81,7 +85,7 @@ class TaskGenerator:
         if self.is_source and len(self.depends_on):
             raise RuntimeError("A source cannot depend on any data type")
         self.wants_input = {dt: 0 for dt in self.depends_on}
-        self.seen_input = self.wants_input.copy()
+        self.seen_input = {dt: -1 for dt in self.depends_on}
 
     def __repr__(self):
         _from = _to = ''
@@ -93,13 +97,7 @@ class TaskGenerator:
 
     def get_task(self, inputs=None, is_final=False) -> Task:
         """Submit a task to operate on inputs"""
-        if not self.parallel and self.chunk_i != self.last_done_i:
-            raise RuntimeError(f"Attempt to get task for {self} "
-                               f"out of order: {self.chunk_i}, last done is "
-                               f"{self.last_done_i}.")
-        assert not self.all_results_arrived, f"Can't get {self} task: all results already arrived"
-        assert not self.final_task_submitted, f"Can't get {self} task: final task already submitted"
-
+        self._check_can_submit()
         self.chunk_i += 1
 
         if is_final or self.is_source:
@@ -109,17 +107,9 @@ class TaskGenerator:
             else:
                 content = partial(self._task_function, chunk_i=self.chunk_i)
         else:
-            # Validate inputs
+            self._validate_inputs(inputs)
             for k in inputs:
-                if not isinstance(inputs[k], np.ndarray):
-                    raise RuntimeError(f"Got {type(inputs[k])} instead of np"
-                                       f"array as input {k} given to {self}")
-                if k not in self.wants_input:
-                    raise RuntimeError(f"Unwanted input {k} given to {self}")
                 self.seen_input[k] += 1
-            for k in self.wants_input:
-                if k not in inputs:
-                    raise RuntimeError(f"Missing input {k} to {self}")
 
             if self.submit_to == 'user':
                 assert len(self.wants_input) == 1
@@ -128,10 +118,11 @@ class TaskGenerator:
                 content = partial(self._task_function,
                                   chunk_i=self.chunk_i,
                                   **inputs)
-            if not self.parallel:
+
+            if not self.changing_inputs:
                 # Request the next set of inputs
-                for dt, i in self.wants_input.items():
-                    self.wants_input[dt] = i + 1
+                for dt in self.wants_input:
+                    self.wants_input[dt] += 1
 
         if is_final:
             self.final_task_submitted = True
@@ -141,8 +132,32 @@ class TaskGenerator:
                     chunk_i=self.chunk_i,
                     is_final=is_final)
 
+    def could_submit_new_task(self):
+        """Return if we are ready to submit a new task
+        provided the required inputs are available.
+        """
+        try:
+            self._check_can_submit()
+            return True
+        except CannotSubmitNewTask:
+            return False
+
+    def _check_can_submit(self):
+        """Raises RuntimeError unless we are ready to submit a new task"""
+        if not self.parallel and self.chunk_i != self.last_done_i:
+            raise CannotSubmitNewTask(
+                f"Attempt to get task for {self} "
+                f"out of order: {self.chunk_i}, last done is {self.last_done_i}.")
+        if self.all_results_arrived:
+            raise CannotSubmitNewTask(
+                f"Can't get {self} task: all results already arrived")
+        if self.final_task_submitted:
+            raise CannotSubmitNewTask(
+                "Can't get {self} task: final task already submitted")
+
     def get_result(self, task: Task):
-        # Update accounting
+        """Return result of task"""
+        assert self is task.generator, "Hey, that's not my task!"
         if task.is_final:
             # Note we set this BEFORE fetching raising exception on a failed
             # result, so we do not retry a failed finishing task.
@@ -163,26 +178,43 @@ class TaskGenerator:
             assert isinstance(result, tuple) and len(result) == 2, \
                 f"{self} changes inputs but didn't return a two-tuple"
             result, new_inputs = result
-            self.wants_input = {dt: self.seen_input[dt] for dt in new_inputs}
+            self.wants_input = {dt: self.seen_input[dt] + 1
+                                for dt in new_inputs}
 
         # Check and return result
         if result is None:
             assert task.is_final, f"{task} is not final but returned None"
         else:
-            if self.submit_to == 'user':
-                assert isinstance(result, np.ndarray),\
-                    f"Attempt to yield a {type(result)} rather than a " \
-                    f"numpy array to the user"
-            else:
-                assert isinstance(result, dict), \
-                    f"{task} returned a {type(result)} rather than a dict"
-                for k in result:
-                    assert k in self.provides, \
-                        f"{task} provided unwanted output {k}"
-                for k in self.provides:
-                    assert k in result, \
-                        f"{task} failed to provide needed output {k}"
+            self._validate_results(task, result)
         return result
+
+    def _validate_inputs(self, inputs: ty.Dict[str, np.ndarray]):
+        """Check if correct inputs dict is provided"""
+        for k in inputs:
+            if not isinstance(inputs[k], np.ndarray):
+                raise RuntimeError(f"Got {type(inputs[k])} instead of np"
+                                   f"array as input {k} given to {self}")
+            if k not in self.wants_input:
+                raise RuntimeError(f"Unwanted input {k} given to {self}")
+        for k in self.wants_input:
+            if k not in inputs:
+                raise RuntimeError(f"Missing input {k} to {self}")
+
+    def _validate_results(self, task, result):
+        """Check if task returned the correct result"""
+        if self.submit_to == 'user':
+            assert isinstance(result, np.ndarray), \
+                f"Attempt to yield a {type(result)} rather than a " \
+                f"numpy array to the user"
+        else:
+            assert isinstance(result, dict), \
+                f"{task} returned a {type(result)} rather than a dict"
+            for k in result:
+                assert k in self.provides, \
+                    f"{task} provided unwanted output {k}"
+            for k in self.provides:
+                assert k in result, \
+                    f"{task} failed to provide needed output {k}"
 
     def _task_function(self, chunk_i: int, is_final=False, **kwargs)\
             -> ty.Dict[str, np.ndarray]:
@@ -267,15 +299,13 @@ class Scheduler:
         self.stored_data = {
             dt: StoredData(dt, tgs)
             for dt, tgs in self.who_wants.items()}
-        print(self.task_generators, self.stored_data)
 
     def main_loop(self):
         while True:
             self._receive_from_done_tasks()
             task = self._get_new_task()
             if task is None:
-                # No more work, except pending tasks
-                # and tasks that may follow from their results.
+                # No work right now.
                 if not self.pending_tasks:
                     if all([tg.all_results_arrived
                             for tg in self.task_generators]):
@@ -285,7 +315,6 @@ class Scheduler:
                         "but data is not exhausted!"))
                 # Wait for a pending task to complete
             else:
-                # print(f"Submitting task {task}")
                 if task.submit_to == 'user':
                     # This is not a real task, we just have to submit
                     # a piece of the final target to the user
@@ -329,6 +358,7 @@ class Scheduler:
                 continue
             for dtype, result in result.items():
                 if dtype not in self.stored_data:
+                    # TODO: consider: can be a bug but can also happen
                     print(f"Got {dtype} which nobody wants, discarding...")
                     continue
                 d = self.stored_data[dtype]
@@ -354,32 +384,19 @@ class Scheduler:
         self.pending_tasks += [task]
 
     def _get_new_task(self):
+        """Return a new task, or None, if it is wiser or necessary to wait"""
         external_waits = []    # TaskGenerators waiting for external conditions
         sources = []           # Sources we could load more data from
         requests_for = defaultdict(int)  # Requests for particular inputs
-
-        # Which inputs are exhausted?
-        # Note final tasks can return results, so we check for
-        # all_results_arrived, not final_task_submitted!
-        exhausted_inputs = sum([list(tg.provides)
-                                for tg in self.task_generators
-                                if tg.all_results_arrived],
-                               [])
+        exhausted_dtypes = self._get_exhausted()
 
         for tg in self.task_generators:
-            if tg.final_task_submitted:
+            if not tg.could_submit_new_task():
                 continue
-
-            # If not parallelizable, check previous task has completed
-            if not tg.parallel and tg.last_done_i < tg.chunk_i:
-                # print(f"{tg} waiting on completion of last task. "
-                #       f"Last done: {tg.last_done_i}, chunk_i {tg.chunk_i}")
-                continue        # Need previous task to finish first
 
             # Are the inputs exhausted?
             if ((not tg.is_source or tg.external_inputs_exhausted())
-                    and all([dt in exhausted_inputs for dt in tg.depends_on])):
-                # print(f"inputs exhausted for {tg}")
+                    and all([dt in exhausted_dtypes for dt in tg.depends_on])):
                 if not tg.final_task_submitted:
                     return tg.get_task(is_final=True)
                 # Final task submitted, cannot do anything else
@@ -396,18 +413,13 @@ class Scheduler:
                 sources.append(tg)
                 continue
 
-            # Are the required inputs available?
-            inputs_complete = True
-            for dtype, chunk_id in tg.wants_input.items():
-                if chunk_id not in self.stored_data[dtype].stored:
-                    # Need input to arrive first
-                    inputs_complete = False
-                    requests_for[dtype] += 1
-                    break
-            if not inputs_complete:
+            # Any input missing?
+            missing_input = self._get_missing_input(tg)
+            if missing_input is not None:
+                requests_for[missing_input] += 1
                 continue
 
-            # Yes! Submit the task
+            # We're good! Submit the task
             task_inputs = dict()
             for dtype, chunk_i in tg.wants_input.items():
                 self.stored_data[dtype].seen_by_consumers[tg] = chunk_i
@@ -435,17 +447,24 @@ class Scheduler:
             return s.get_task(None)
 
         if external_waits:
-            # We could wait for an external condition...
             if len(self.pending_tasks):
-                # ... but probably an existing task will complete first
+                # Assume an existing task will complete before the condition.
+                # TODO: make configurable?
                 return None
-            # ... so let's do that.
             self._emit_status(f"{external_waits} waiting on external condition")
             time.sleep(5)
             # TODO: for very long waits this will trip the recursion limit!
             return self._get_new_task()
 
         # No work to do. Maybe a pending task will still generate some though.
+        return None
+
+    def _get_missing_input(self, tg):
+        """Return a datatype for which the chunk needed by tg is not available,
+        or None."""
+        for dtype, chunk_id in tg.wants_input.items():
+            if chunk_id not in self.stored_data[dtype].stored:
+                return dtype
         return None
 
     def _cleanup_cache(self):
@@ -484,3 +503,12 @@ class Scheduler:
             t.future.cancel()
         self.threadpool.shutdown()
         self.processpool.shutdown()
+
+    def _get_exhausted(self):
+        """Return list of provided datatypes that are exhausted"""
+        # Note final tasks can return results, so we check for
+        # all_results_arrived, not final_task_submitted!
+        return sum([list(tg.provides)
+                    for tg in self.task_generators
+                    if tg.all_results_arrived],
+                    [])
