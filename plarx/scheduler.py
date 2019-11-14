@@ -14,35 +14,29 @@ from .utils import exporter
 export, __all__ = exporter()
 
 
-class Task:
+class GetTaskStatus(Enum):
+    NO_TASK = 0
+    GOT_TASK = 1
+    YIELD_TO_USER = 2
+    WAIT_EXTERNAL = 3
+
+
+class Task(ty.NamedTuple):
     """Task object, tracking a future submitted to a pool
 
-    :param content: Task to submit to thread/process pool
-    or data to yield to user
     :param is_final: If true, mark TaskGenerator as finished on completion
-    :param generator: Generator that made the task (need python 3.7
-    to annotate properly)
-    :param future: Future object. Result will be {dtypename: array, ...}
-    or possibly, and only for the final task, None. Usually set later.
+    :param generator: Generator that made the task.
     :param chunk_i: Chunk number about to be produced
-    """
-    content: ty.Union[np.ndarray, ty.Callable]
-    is_final: False
-    generator: ty.Any
-    provides: ty.Tuple[str]
-    submit_to: str
-    future: cf.Future = None
-    chunk_i = 0
+    :param future: Future object. Result will be {dtypename: array, ...}
+    or possibly, and only for the final task, None.
 
-    def __init__(self, content, generator, chunk_i, is_final=False,
-                 future=None):
-        self.chunk_i = chunk_i
-        self.generator = generator
-        self.provides = self.generator.provides
-        self.submit_to = self.generator.submit_to
-        self.content = content
-        self.is_final = is_final
-        self.future = future
+    For tasks that are placeholders for data to be returned to the user,
+    future directly stores the result.
+    """
+    is_final: bool
+    generator: ty.Any       # Wait for python 4.0 / future annotations
+    future: ty.Union[cf.Future, np.ndarray]
+    chunk_i: int
 
     def __repr__(self):
         return f"{self.generator}:{self.chunk_i}"
@@ -96,7 +90,8 @@ class TaskGenerator:
             _to = self.provides[0]
         return f"[{_from}>{_to}]"
 
-    def get_task(self, inputs=None, is_final=False) -> Task:
+
+    def get_task(self, inputs=None, is_final=False) -> (GetTaskStatus, Task):
         """Submit a task to operate on inputs"""
         self._check_can_submit()
         self.chunk_i += 1
@@ -128,21 +123,18 @@ class TaskGenerator:
         if is_final:
             self.final_task_submitted = True
 
-        if self.submit_to in self.executors:
-            future = self.executors[self.submit_to].submit(content)
-            status = GetTaskStatus.GOT_TASK
-        elif self.submit_to == 'user':
-            future = None
+        if self.submit_to == 'user':
             status = GetTaskStatus.YIELD_TO_USER
+            future = content
         else:
-            raise RuntimeError(f"Invalid submission target {task.submit_to}")
+            status = GetTaskStatus.GOT_TASK
+            future = self.executors[self.submit_to].submit(content)
 
-        task = Task(content=content,
-                    future=future,
-                    generator=self,
-                    chunk_i=self.chunk_i,
-                    is_final=is_final)
-        return status, task
+        return status, Task(
+                future=future,
+                generator=self,
+                chunk_i=self.chunk_i,
+                is_final=is_final)
 
     def could_submit_new_task(self):
         """Return if we are ready to submit a new task
@@ -169,7 +161,6 @@ class TaskGenerator:
 
     def get_result(self, task: Task):
         """Return result of task"""
-        assert self is task.generator, "Hey, that's not my task!"
         if task.is_final:
             # Note we set this BEFORE fetching raising exception on a failed
             # result, so we do not retry a failed finishing task.
@@ -179,7 +170,7 @@ class TaskGenerator:
 
         # Fetch result
         if self.submit_to == 'user':
-            result = task.content
+            result = task.future
         else:
             if not task.future.done():
                 raise RuntimeError("get_result called before task was done")
@@ -276,13 +267,6 @@ class StoredData:
                                   for tg in wanted_by}
 
 
-class GetTaskStatus(Enum):
-    NO_TASK = 0
-    GOT_TASK = 1
-    YIELD_TO_USER = 2
-    WAIT_EXTERNAL = 3
-
-
 @export
 class Scheduler:
     pending_tasks: ty.List[Task]
@@ -348,7 +332,8 @@ class Scheduler:
                 continue
 
             elif status is GetTaskStatus.WAIT_EXTERNAL:
-                self._emit_status(f"{external_waits} waiting on external condition")
+                # TODO: emit who is waiting
+                self._emit_status(f"Waiting on external condition")
                 time.sleep(5)
                 continue
 
