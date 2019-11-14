@@ -1,5 +1,6 @@
 from collections import defaultdict
 import concurrent.futures as cf
+from enum import Enum
 from functools import partial
 import os
 from random import random
@@ -127,7 +128,15 @@ class TaskGenerator:
         if is_final:
             self.final_task_submitted = True
 
+        if self.submit_to in self.executors:
+            future = self.executors[self.submit_to].submit(content)
+        elif self.submit_to == 'user':
+            future = None
+        else:
+            raise RuntimeError(f"Invalid submission target {task.submit_to}")
+
         return Task(content=content,
+                    future=future,
                     generator=self,
                     chunk_i=self.chunk_i,
                     is_final=is_final)
@@ -264,6 +273,13 @@ class StoredData:
                                   for tg in wanted_by}
 
 
+class GetTaskStatus(Enum):
+    NO_TASK = 0
+    GOT_TASK = 1
+    YIELD_TO_USER = 2
+    WAIT_EXTERNAL = 3
+
+
 @export
 class Scheduler:
     pending_tasks: ty.List[Task]
@@ -286,8 +302,13 @@ class Scheduler:
         self.task_generators.sort(key=lambda _tg: (_tg.priority, _tg.depth))
         self.pending_tasks = []
         self.this_process = psutil.Process(os.getpid())
-        self.processpool = cf.ProcessPoolExecutor(max_workers=self.max_workers)
-        self.threadpool = cf.ThreadPoolExecutor(max_workers=self.max_workers)
+
+        self.executors = dict(
+            process=cf.ProcessPoolExecutor(max_workers=self.max_workers),
+            thread=cf.ThreadPoolExecutor(max_workers=self.max_workers))
+        # TODO: how to pass to taskgens?
+        for tg in task_generators:
+            tg.executors = self.executors
 
         self.who_wants = defaultdict(list)
         for tg in self.task_generators:
@@ -303,8 +324,17 @@ class Scheduler:
     def main_loop(self):
         while True:
             self._receive_from_done_tasks()
-            task = self._get_new_task()
-            if task is None:
+            status, task = self._get_new_task()
+
+            if status is GetTaskStatus.WAIT_EXTERNAL:
+                self._emit_status(f"{external_waits} waiting on external condition")
+                time.sleep(5)
+                continue   # Try finding a task again
+
+            if task is not None and task.generator.submit_to == 'user':
+                status = GetTaskStatus.YIELD_TO_USER
+
+            if status is GetTaskStatus.NO_TASK:
                 # No work right now.
                 if not self.pending_tasks:
                     if all([tg.all_results_arrived
@@ -315,7 +345,7 @@ class Scheduler:
                         "but data is not exhausted!"))
                 # Wait for a pending task to complete
             else:
-                if task.submit_to == 'user':
+                if status is GetTaskStatus.YIELD_TO_USER:
                     # This is not a real task, we just have to submit
                     # a piece of the final target to the user
                     result = self._get_task_result(task)
@@ -329,8 +359,8 @@ class Scheduler:
                 if len(self.pending_tasks) < self.max_workers:
                     continue            # Find another task
             self.wait_until_task_done()
-        self.threadpool.shutdown()
-        self.processpool.shutdown()
+        for exc in self.executors.values():
+            exc.shutdown()
 
     def wait_until_task_done(self):
         while True:
@@ -374,13 +404,6 @@ class Scheduler:
             self.exit_with_exception(e, f"Exception from {task}")
 
     def _submit_task(self, task: Task):
-        if task.submit_to == 'thread':
-            f = self.threadpool.submit(task.content)
-        elif task.submit_to == 'process':
-            f = self.processpool.submit(task.content)
-        else:
-            raise RuntimeError(f"Invalid submission target {task.submit_to}")
-        task.future = f
         self.pending_tasks += [task]
 
     def _get_new_task(self):
@@ -398,7 +421,7 @@ class Scheduler:
             if ((not tg.is_source or tg.external_inputs_exhausted())
                     and all([dt in exhausted_dtypes for dt in tg.depends_on])):
                 if not tg.final_task_submitted:
-                    return tg.get_task(is_final=True)
+                    return GetTaskStatus.GOT_TASK, tg.get_task(is_final=True)
                 # Final task submitted, cannot do anything else
                 continue
 
@@ -427,7 +450,7 @@ class Scheduler:
             self._cleanup_cache()
 
             task = tg.get_task(task_inputs)
-            return task
+            return GetTaskStatus.GOT_TASK, task
 
         if sources:
             # No computation tasks to do, but we could load new data
@@ -436,7 +459,7 @@ class Scheduler:
                 # ... Let's not though; instead wait for current tasks.
                 # (We could perhaps also wait for an external condition
                 # but in all likelihood a task will complete soon enough)
-                return None
+                return GetTaskStatus.NO_TASK, None
             # Load data for the source that is blocking the most tasks
             # Jitter it a bit for better performance on ties..
             # TODO: There is a better way, but I'm too lazy now
@@ -444,20 +467,18 @@ class Scheduler:
                                             for dt in s.provides]) + random())
                                    for s in sources]
             s, _ = max(requests_for_source, key=lambda q: q[1])
-            return s.get_task(None)
+            return GetTaskStatus.GOT_TASK, s.get_task(None)
 
         if external_waits:
             if len(self.pending_tasks):
-                # Assume an existing task will complete before the condition.
-                # TODO: make configurable?
-                return None
-            self._emit_status(f"{external_waits} waiting on external condition")
-            time.sleep(5)
-            # TODO: for very long waits this will trip the recursion limit!
-            return self._get_new_task()
+                # Assume an existing task will complete before the wait time.
+                # TODO: Good idea? Maybe make configurable?
+                return GetTaskStatus.NO_TASK, None
+            else:
+                return GetTaskStatus.WAIT_EXTERNAL, None
 
         # No work to do. Maybe a pending task will still generate some though.
-        return None
+        return GetTaskStatus.NO_TASK, None
 
     def _get_missing_input(self, tg):
         """Return a datatype for which the chunk needed by tg is not available,
