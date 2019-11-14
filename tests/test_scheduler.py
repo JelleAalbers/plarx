@@ -11,16 +11,17 @@ class BasicSource(plarx.TaskGenerator):
 
     def external_input_ready(self):
         # print(self.chunk_i, "external check", self.chunk_i + 1 < self.n_chunks - 1)
-        return self.chunk_i + 1 < self.n_chunks - 1
+        return self.last_submitted_i + 1 < self.n_chunks
 
     def external_inputs_exhausted(self):
         # print(self.chunk_i, "external exhausted check", self.chunk_i == self.n_chunks - 1)
-        return self.chunk_i + 1 == self.n_chunks - 1
+        return self.last_submitted_i + 1 == self.n_chunks
 
-    def task_function(self, chunk_i, is_final=False, **kwargs):
+    def task_function(self, chunk_i, **kwargs):
+        if len(kwargs):
+            raise ValueError(f"Got spurious kwargs {kwargs}")
         if chunk_i >= self.n_chunks:
-            raise RuntimeError("Tried to start too many tasks. "
-                               f"is_final = {is_final}")
+            raise RuntimeError("Tried to start too many tasks.")
         # print(f"Source task {chunk_i} running. self.chunk_i is {self.chunk_i}")
         return dict(widgets=np.ones(42, dtype=np.float32) * chunk_i)
 
@@ -32,7 +33,7 @@ def test_source():
         yield_output='widgets')
     i = 0
     for i, x in enumerate(sched.main_loop()):
-        print(f"USER JUST GOT CHUNK {i}")
+        print(f"USER JUST GOT CHUNK {i}: {x}")
         assert i < 10
         np.testing.assert_array_equal(x, np.ones(42, dtype=np.float32) * i)
     assert i == 9
@@ -42,7 +43,9 @@ class BasicProc(plarx.TaskGenerator):
     provides = ('doodads',)
     depends_on = ('widgets',)
 
-    def _task_function(self, chunk_i, is_final=False, **kwargs):
+    def task_function(self, chunk_i, is_final=False, **kwargs):
+        if is_final:
+            return None
         for k, v in kwargs.items():
             assert k == 'widgets'
             assert isinstance(v, np.ndarray), \
@@ -57,7 +60,7 @@ def test_process():
         yield_output='doodads')
     i = 0
     for i, x in enumerate(sched.main_loop()):
-        print(f"USER JUST GOT CHUNK {i}")
+        print(f"USER JUST GOT CHUNK {i}: {x}")
         assert i < 10
         np.testing.assert_array_equal(x, np.ones(21, dtype=np.float32) * i)
     assert i == 9
@@ -119,4 +122,4 @@ def test_complex():
         print(f"USER JUST GOT CHUNK {i}")
         assert i < 8
         np.testing.assert_array_equal(x, np.ones(11, dtype=np.int16) * i)
-    assert i == 7, sched.exit_with_exception(RuntimeError("OOPS"))
+    assert i == 7, sched.exit_with_exception(RuntimeError(f"Ended at {i}"))
