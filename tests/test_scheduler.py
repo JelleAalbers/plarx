@@ -10,13 +10,18 @@ class BasicSource(plarx.TaskGenerator):
     n_chunks = 10
 
     def external_input_ready(self):
-        return self.last_done_i < self.n_chunks - 1
+        # print(self.chunk_i, "external check", self.chunk_i + 1 < self.n_chunks - 1)
+        return self.chunk_i + 1 < self.n_chunks - 1
 
     def external_inputs_exhausted(self):
-        return self.last_done_i == self.n_chunks - 1
+        # print(self.chunk_i, "external exhausted check", self.chunk_i == self.n_chunks - 1)
+        return self.chunk_i + 1 == self.n_chunks - 1
 
     def task_function(self, chunk_i, is_final=False, **kwargs):
-        print(f"Source task {chunk_i} running. self.chunk_i is {self.chunk_i}")
+        if chunk_i >= self.n_chunks:
+            raise RuntimeError("Tried to start too many tasks. "
+                               f"is_final = {is_final}")
+        # print(f"Source task {chunk_i} running. self.chunk_i is {self.chunk_i}")
         return dict(widgets=np.ones(42, dtype=np.float32) * chunk_i)
 
 
@@ -38,6 +43,10 @@ class BasicProc(plarx.TaskGenerator):
     depends_on = ('widgets',)
 
     def _task_function(self, chunk_i, is_final=False, **kwargs):
+        for k, v in kwargs.items():
+            assert k == 'widgets'
+            assert isinstance(v, np.ndarray), \
+                f"Got a {type(v)} instead of a numpy array for {k}"
         return dict(doodads=np.ones(21, dtype=np.int) * chunk_i)
 
 
@@ -55,7 +64,7 @@ def test_process():
 
 
 class SecondSource(BasicSource):
-    n_chunks = 3
+    n_chunks = 4
     provides = ('thingies',)
 
     def task_function(self, chunk_i, is_final=False, **kwargs):
@@ -64,7 +73,6 @@ class SecondSource(BasicSource):
 
 
 class FunnyCombination(plarx.TaskGenerator):
-    n_chunks = 3
     depends_on = ('doodads', 'thingies')
     provides = ('gizmos',)
     changing_inputs = True
@@ -72,6 +80,8 @@ class FunnyCombination(plarx.TaskGenerator):
     toggle = False  # Will be switched to true on first call
 
     def task_function(self, chunk_i, is_final=False, **kwargs):
+        for k, v in kwargs.items():
+            assert isinstance(v, np.ndarray), f"Got a {type(v)} rather than a numpy array for {k}"
         bla = {k: kwargs[k][0] for k in kwargs}
         print(f"Gizmos task called wth {chunk_i}, {is_final}, {bla}")
         if is_final:

@@ -22,21 +22,23 @@ class GetTaskStatus(Enum):
 
 
 class Task(ty.NamedTuple):
-    """Task object, tracking a future submitted to a pool
+    """Task object, tracking a future submitted to a pool"""
 
-    :param is_final: If true, mark TaskGenerator as finished on completion
-    :param generator: Generator that made the task.
-    :param chunk_i: Chunk number about to be produced
-    :param future: Future object. Result will be {dtypename: array, ...}
-    or possibly, and only for the final task, None.
-
-    For tasks that are placeholders for data to be returned to the user,
-    future directly stores the result.
-    """
+    # If true, mark TaskGenerator as finished on completion
     is_final: bool
+
+    # Generator that made the task.
     generator: ty.Any       # Wait for python 4.0 / future annotations
-    future: ty.Union[cf.Future, np.ndarray]
+
+    # Chunk number about to be produced
     chunk_i: int
+
+    # Future object. Result will be {dtypename: array, ...}
+    # or possibly, and only for the final task, None.
+    #
+    # For tasks that are placeholders for data to be returned to the user,
+    # future directly stores the result.
+    future: ty.Union[cf.Future, np.ndarray]
 
     def __repr__(self):
         return f"{self.generator}:{self.chunk_i}"
@@ -83,13 +85,9 @@ class TaskGenerator:
         self.seen_input = {dt: -1 for dt in self.depends_on}
 
     def __repr__(self):
-        _from = _to = ''
-        if len(self.wants_input):
-            _from = list(self.wants_input.keys())[0]
-        if len(self.provides):
-            _to = self.provides[0]
+        _from = ','.join(list(self.wants_input.keys()))
+        _to = ','.join(self.provides)
         return f"[{_from}>{_to}]"
-
 
     def get_task(self, inputs=None, is_final=False) -> (GetTaskStatus, Task):
         """Submit a task to operate on inputs"""
@@ -98,22 +96,17 @@ class TaskGenerator:
 
         if is_final or self.is_source:
             assert inputs is None, "Passed inputs to source or final task"
-            if self.submit_to == 'user':
-                content = None
-            else:
-                content = partial(self._task_function, chunk_i=self.chunk_i)
+            content = partial(self._task_function,
+                              is_final=is_final,
+                              chunk_i=self.chunk_i)
         else:
             self._validate_inputs(inputs)
             for k in inputs:
                 self.seen_input[k] += 1
 
-            if self.submit_to == 'user':
-                assert len(self.wants_input) == 1
-                content = list(inputs.values())[0]
-            else:
-                content = partial(self._task_function,
-                                  chunk_i=self.chunk_i,
-                                  **inputs)
+            content = partial(self._task_function,
+                              chunk_i=self.chunk_i,
+                              **inputs)
 
             if not self.changing_inputs:
                 # Request the next set of inputs
@@ -123,12 +116,8 @@ class TaskGenerator:
         if is_final:
             self.final_task_submitted = True
 
-        if self.submit_to == 'user':
-            status = GetTaskStatus.YIELD_TO_USER
-            future = content
-        else:
-            status = GetTaskStatus.GOT_TASK
-            future = self.executors[self.submit_to].submit(content)
+        status = GetTaskStatus.GOT_TASK
+        future = self.executors[self.submit_to].submit(content)
 
         return status, Task(
                 future=future,
@@ -169,18 +158,19 @@ class TaskGenerator:
             self.last_done_i = task.chunk_i
 
         # Fetch result
-        if self.submit_to == 'user':
-            result = task.future
-        else:
-            if not task.future.done():
-                raise RuntimeError("get_result called before task was done")
-            result = task.future.result()  # Will raise if exception
+        if not task.future.done():
+            raise RuntimeError("get_result called before task was done")
+        result = task.future.result()  # Will raise if exception
 
         # Record new inputs
         if self.changing_inputs:
-            assert isinstance(result, tuple) and len(result) == 2, \
-                f"{self} changes inputs but didn't return a two-tuple"
-            result, new_inputs = result
+            if task.is_final:
+                new_inputs = {}
+            else:
+                assert isinstance(result, tuple) and len(result) == 2, \
+                    f"{self} changes inputs but returned a {type(result)} " \
+                    f"rather than a two-tuple"
+                result, new_inputs = result
             self.wants_input = {dt: self.seen_input[dt] + 1
                                 for dt in new_inputs}
 
@@ -205,19 +195,14 @@ class TaskGenerator:
 
     def _validate_results(self, task, result):
         """Check if task returned the correct result"""
-        if self.submit_to == 'user':
-            assert isinstance(result, np.ndarray), \
-                f"Attempt to yield a {type(result)} rather than a " \
-                f"numpy array to the user"
-        else:
-            assert isinstance(result, dict), \
-                f"{task} returned a {type(result)} rather than a dict"
-            for k in result:
-                assert k in self.provides, \
-                    f"{task} provided unwanted output {k}"
-            for k in self.provides:
-                assert k in result, \
-                    f"{task} failed to provide needed output {k}"
+        assert isinstance(result, dict), \
+            f"{task} returned a {type(result)} rather than a dict"
+        for k in result:
+            assert k in self.provides, \
+                f"{task} provided unwanted output {k}"
+        for k in self.provides:
+            assert k in result, \
+                f"{task} failed to provide needed output {k}"
 
     def _task_function(self, chunk_i: int, is_final=False, **kwargs)\
             -> ty.Dict[str, np.ndarray]:
@@ -266,6 +251,9 @@ class StoredData:
         self.seen_by_consumers = {tg: -1
                                   for tg in wanted_by}
 
+    def __repr__(self):
+        return f'StoredData[{self.dtype}]'
+
 
 @export
 class Scheduler:
@@ -275,20 +263,18 @@ class Scheduler:
     task_generators: ty.List[TaskGenerator]
     this_process: psutil.Process
     threshold_mb = 1000
+    yield_output: ty.Union[None, str]
 
     def __init__(self, task_generators: ty.List[TaskGenerator],
                  yield_output=None, max_workers=5):
         self.max_workers = max_workers
-        if yield_output:
-            yielder = type('YieldOutputTaskGenerator',
-                           (TaskGenerator,),
-                           dict(depends_on=(yield_output,),
-                                submit_to='user'))()
-            task_generators = task_generators + [yielder]
         self.task_generators = task_generators
         self.task_generators.sort(key=lambda _tg: (_tg.priority, _tg.depth))
         self.pending_tasks = []
         self.this_process = psutil.Process(os.getpid())
+
+        self.yield_output = yield_output
+        self.last_yielded_chunk = -1
 
         self.executors = dict(
             process=cf.ProcessPoolExecutor(max_workers=self.max_workers),
@@ -297,20 +283,36 @@ class Scheduler:
         for tg in task_generators:
             tg.executors = self.executors
 
-        self.who_wants = defaultdict(list)
+        who_wants = defaultdict(list)
         for tg in self.task_generators:
             if not len(tg.depends_on) and not tg.is_source:
                 raise RuntimeError(
                     f"{tg} has no dependencies but it is not a source?")
             for dt in tg.depends_on:
-                self.who_wants[dt].append(tg)
+                who_wants[dt].append(tg)
+        if self.yield_output:
+            who_wants.setdefault(self.yield_output, [])
+
         self.stored_data = {
             dt: StoredData(dt, tgs)
-            for dt, tgs in self.who_wants.items()}
+            for dt, tgs in who_wants.items()}
 
     def main_loop(self):
         while True:
+            self._cleanup_cache()
             self._receive_from_done_tasks()
+
+            if self.yield_output:
+                od = self.stored_data[self.yield_output]
+                while self.last_yielded_chunk + 1 in od.stored:
+                    result = od.stored[self.last_yielded_chunk + 1]
+                    if not isinstance(result, np.ndarray):
+                        raise ValueError(
+                            f"Attempt to yield a {type(result)} rather "
+                            f"than a numpy array to the user")
+                    yield result
+                    self.last_yielded_chunk += 1
+
             status, task = self._get_new_task()
 
             if status is GetTaskStatus.GOT_TASK:
@@ -344,8 +346,6 @@ class Scheduler:
                 else:
                     yield result
                 continue
-
-
 
         for exc in self.executors.values():
             exc.shutdown()
@@ -432,7 +432,6 @@ class Scheduler:
             for dtype, chunk_i in tg.wants_input.items():
                 self.stored_data[dtype].seen_by_consumers[tg] = chunk_i
                 task_inputs[dtype] = self.stored_data[dtype].stored[chunk_i]
-            self._cleanup_cache()
 
             return tg.get_task(task_inputs)
 
@@ -476,9 +475,14 @@ class Scheduler:
         """Remove any data from our stored_data that has been seen
         by all the consumers"""
         for d in self.stored_data.values():
-            if not len(d.seen_by_consumers):
+
+            seen_by_all = min(d.seen_by_consumers.values(),
+                              default=float('inf'))
+            if d.dtype == self.yield_output:
+                seen_by_all = min(seen_by_all, self.last_yielded_chunk)
+            elif not len(d.seen_by_consumers):
                 raise RuntimeError(f"{d} is not consumed by anyone??")
-            seen_by_all = min(d.seen_by_consumers.values())
+
             d.stored = {chunk_i: data
                         for chunk_i, data in d.stored.items()
                         if chunk_i > seen_by_all}
@@ -489,8 +493,9 @@ class Scheduler:
             print(f"{tg}:"
                   f"\n\twants {tg.wants_input}, "
                   f"\n\tat chunk {tg.chunk_i}, "
-                  f"\n\tfinished {tg.all_results_arrived},"
-                  f" is source {tg.is_source}")
+                  f"\n\tfinal_task_submitted {tg.final_task_submitted},"
+                  f"\n\tall_results_arrived {tg.all_results_arrived},"
+                  f"\n\tis source {tg.is_source}")
         for dt, d in self.stored_data.items():
             print(f"{dt}: stored: {list(d.stored.keys())}, "
                   f"last_contiguous: {d.last_contiguous}, "
