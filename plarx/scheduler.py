@@ -66,10 +66,10 @@ class TaskGenerator:
     priority = 0                # 0 = saver/target, 1 = source, 2 = other
     depth = 0                   # Dependency hops to final target
 
-    pending_is: set              # Set of pending task numbers
-    last_submitted_i = -1        # Number of last emitted task
-    highest_done_i = -1          # Highest completed task number
-    final_task_i = float('inf')  # Number of final task (if known)
+    pending_is: set             # Set of pending task numbers
+    last_submitted_i = -1       # Number of last emitted task
+    _highest_done_i = -1        # Highest completed task number, NOT continuous!
+    final_task_i = float('inf')   # Number of final task (if known)
 
     input_cache: ty.Dict[str, np.ndarray]
                                 # Inputs we could not yet pass to computation
@@ -83,7 +83,7 @@ class TaskGenerator:
         if self.pending_is:
             return min(self.pending_is) - 1
         else:
-            return self.highest_done_i
+            return self._highest_done_i
 
     def __init__(self):
         if self.changing_inputs and self.parallel:
@@ -149,11 +149,11 @@ class TaskGenerator:
 
     def _check_can_submit(self):
         """Raises RuntimeError unless we are ready to submit a new task"""
-        if not self.parallel and self.last_submitted_i != self.highest_done_i:
+        if not self.parallel and self.last_submitted_i != self.highest_continuous_done_i:
             raise CannotSubmitNewTask(
                 f"Attempt to get task for {self} "
                 f"out of order: last submitted {self.last_submitted_i}, "
-                f"but highest_done_i is {self.highest_done_i}.")
+                f"but highest_continuous_done_i is {self.highest_continuous_done_i}.")
         if self.all_results_arrived:
             raise CannotSubmitNewTask(
                 f"Can't get {self} task: all results already arrived")
@@ -166,8 +166,8 @@ class TaskGenerator:
         # Basic bookkeeping
         assert task.chunk_i in self.pending_is
         self.pending_is.discard(task.chunk_i)
-        self.highest_done_i = max(self.highest_done_i, task.chunk_i)
-        if self.highest_done_i == self.final_task_i:
+        self._highest_done_i = max(self._highest_done_i, task.chunk_i)
+        if self.highest_continuous_done_i == self.final_task_i:
             self.all_results_arrived = True
 
         # Fetch result
@@ -389,6 +389,7 @@ class Scheduler:
                 d.stored[task.chunk_i] = result
                 if d.last_contiguous == task.chunk_i - 1:
                     d.last_contiguous += 1
+
         self.pending_tasks = still_pending
 
     def _get_new_task(self):
@@ -406,10 +407,11 @@ class Scheduler:
             if ((not tg.is_source or tg.external_inputs_exhausted())
                     and all([dt in exhausted_dtypes for dt in tg.depends_on])):
                 print(f"Inputs {tg.depends_on} for {tg} exhausted")
-                if not tg.final_task_submitted:
-                    return tg.get_task(is_final=True)
-                # Final task submitted, cannot do anything else
-                continue
+                if tg.final_task_submitted:
+                    # Final task submitted, cannot do anything else
+                    continue
+                # TODO: Gather or discard overhanging inputs for final task
+                return tg.get_task(is_final=True)
 
             # Check external conditions satisfied
             if (not tg.external_input_ready()
@@ -520,7 +522,11 @@ class Scheduler:
         """Return list of provided datatypes that are exhausted"""
         # Note final tasks can return results, so we check for
         # all_results_arrived, not final_task_submitted!
-        return sum([list(tg.provides)
-                    for tg in self.task_generators
-                    if tg.all_results_arrived],
-                    [])
+        exhausted = []
+        for tg in self.task_generators:
+            if not tg.provides or not tg.all_results_arrived:
+                continue
+            for p in tg.provides:
+                if not len(self.stored_data[p].stored):
+                    exhausted.append(p)
+        return exhausted

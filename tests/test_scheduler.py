@@ -90,6 +90,10 @@ class FunnyCombination(plarx.TaskGenerator):
         if is_final:
             return None
         self.toggle = not self.toggle
+
+        import time
+        time.sleep(.1)  # Triggers bug that would otherwise be race condition
+
         if self.toggle:
             # Request only widgets next time
             return (
