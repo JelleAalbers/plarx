@@ -115,6 +115,7 @@ class TaskGenerator:
         """Submit a task to operate on inputs"""
         task_i, inputs = self._prepare_get_task(inputs)
 
+        # Validate inputs
         # Inputs must be dicts of numpy arrays
         for k in inputs:
             if not isinstance(inputs[k], np.ndarray):
@@ -140,11 +141,11 @@ class TaskGenerator:
     def _submit_task(self, content, task_i, is_final) -> (GetTaskStatus, Task):
         future = self.executors[self.submit_to].submit(content)
         self.last_submitted_i += 1
-        return GetTaskStatus.GOT_TASK, Task(
-                future=future,
-                generator=self,
-                chunk_i=task_i,
-                is_final=is_final)
+        return Task(
+            future=future,
+            generator=self,
+            chunk_i=task_i,
+            is_final=is_final)
 
     def get_cleanup_task(self, inputs=None):
         task_i, inputs = self._prepare_get_task(inputs)
@@ -399,12 +400,8 @@ class Scheduler:
             elif status is GetTaskStatus.NO_TASK:
                 # No work right now.
                 if not self.pending_tasks:
-                    if all([tg.all_results_arrived
-                            for tg in self.task_generators]):
-                        break  # All done. We win!
-                    self.exit_with_exception(RuntimeError(
-                        "No available or pending tasks, "
-                        "but data is not exhausted!"))
+                    self.final_checks()
+                    break  # All done. We win!
                 self.wait_until_task_done()
                 continue
 
@@ -417,6 +414,16 @@ class Scheduler:
         for exc in self.executors.values():
             exc.shutdown()
 
+    def final_checks(self):
+        if any([not tg.all_results_arrived
+                for tg in self.task_generators]):
+            self.exit_with_exception(RuntimeError(
+                "No available or pending tasks, "
+                "but data is not exhausted!"))
+        if any([sd.n_stored() for sd in self.stored_data.values()]):
+            self.exit_with_exception(RuntimeError(
+                "End but data is still stored!"))
+
     def wait_until_task_done(self):
         while True:
             done, not_done = cf.wait(
@@ -426,10 +433,6 @@ class Scheduler:
             if len(done):
                 break
             self._emit_status("Waiting for a task to complete")
-
-    def _emit_status(self, msg):
-        print(msg)
-        print(f"\tPending tasks: {self.pending_tasks}")
 
     def _receive_from_done_tasks(self):
         still_pending = []
@@ -451,8 +454,8 @@ class Scheduler:
 
             for dtype, result in result.items():
                 if dtype not in self.stored_data:
-                    # TODO: consider: can be a bug but can also happen
-                    print(f"Got {dtype} which nobody wants, discarding...")
+                    # TODO: make configurable error
+                    # print(f"Got {dtype} which nobody wants, discarding...")
                     continue
                 self.stored_data[dtype].add(data=result, chunk_i=task.chunk_i)
 
@@ -484,7 +487,7 @@ class Scheduler:
                     continue
                 inputs = {dt: self.stored_data[dt].slurp_for(tg)
                           for dt in tg.depends_on}
-                return tg.get_cleanup_task(inputs)
+                return GetTaskStatus.GOT_TASK, tg.get_cleanup_task(inputs)
 
             # Check external conditions satisfied
             if (not tg.external_input_ready()
@@ -498,9 +501,13 @@ class Scheduler:
                 continue
 
             # Any input missing?
-            missing_input = self._get_missing_input(tg)
-            if missing_input is not None:
-                requests_for[missing_input] += 1
+            missing_input = False
+            for dtype, chunk_id in tg.wants_input.items():
+                if not self.stored_data[dtype].has_stored(chunk_id):
+                    requests_for[dtype] += 1
+                    missing_input = True
+                    break
+            if missing_input:
                 continue
 
             # We're good! Grab all inputs and submit.
@@ -509,7 +516,7 @@ class Scheduler:
                 task_inputs[dtype] = self.stored_data[dtype].grab_for(
                     tg=tg, chunk_i=chunk_i)
 
-            return tg.get_task(task_inputs)
+            return GetTaskStatus.GOT_TASK, tg.get_task(task_inputs)
 
         if sources:
             # No computation tasks to do, but we could load new data
@@ -526,7 +533,7 @@ class Scheduler:
                                             for dt in s.provides]) + random())
                                    for s in sources]
             s, _ = max(requests_for_source, key=lambda q: q[1])
-            return s.get_task(None)
+            return GetTaskStatus.GOT_TASK, s.get_task(None)
 
         if external_waits:
             if len(self.pending_tasks):
@@ -539,13 +546,9 @@ class Scheduler:
         # No work to do. Maybe a pending task will still generate some though.
         return GetTaskStatus.NO_TASK, None
 
-    def _get_missing_input(self, tg):
-        """Return a datatype for which the chunk needed by tg is not available,
-        or None."""
-        for dtype, chunk_id in tg.wants_input.items():
-            if not self.stored_data[dtype].has_stored(chunk_id):
-                return dtype
-        return None
+    def _emit_status(self, msg):
+        print(msg)
+        print(f"\tPending tasks: {self.pending_tasks}")
 
     def exit_with_exception(self, exception, extra_message=''):
         print(extra_message)
