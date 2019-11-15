@@ -91,8 +91,9 @@ class FunnyCombination(plarx.TaskGenerator):
             return None
         self.toggle = not self.toggle
 
+        # Triggers some bugs that would otherwise be race conditions
         import time
-        time.sleep(.1)  # Triggers bug that would otherwise be race condition
+        time.sleep(.1)
 
         if self.toggle:
             # Request only widgets next time
@@ -113,7 +114,10 @@ class FunnyCombination(plarx.TaskGenerator):
     # 6: doodads 6 + thingies 3
     # 7: doodads 7
     # NO 8: no more thingies available, rest of doodads discarded
-    # TODO: NOT GOOD, want to at least see rest of doodads in final task
+    # Cleanup task: sees doodads 8 and 9
+
+    def cleanup(self, **inputs):
+        assert len(inputs['doodads']) == 2
 
 
 def test_complex():
