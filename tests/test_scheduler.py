@@ -30,7 +30,7 @@ def test_source():
     """Single source, no processing"""
     sched = plarx.Scheduler(
         [BasicSource()],
-        yield_output='widgets')
+        yield_outputs='widgets')
     i = 0
     for i, x in enumerate(sched.main_loop()):
         print(f"USER JUST GOT CHUNK {i}: {x}")
@@ -57,7 +57,7 @@ def test_process():
     """Source + processing"""
     sched = plarx.Scheduler(
         [BasicSource(), BasicProc()],
-        yield_output='doodads')
+        yield_outputs='doodads')
     i = 0
     for i, x in enumerate(sched.main_loop()):
         print(f"USER JUST GOT CHUNK {i}: {x}")
@@ -124,7 +124,7 @@ def test_complex():
     """Multiple dependencies, sources, and wants_input switching"""
     sched = plarx.Scheduler(
         [BasicSource(), BasicProc(), SecondSource(), FunnyCombination()],
-        yield_output='gizmos')
+        yield_outputs='gizmos')
     i = 0
     for i, x in enumerate(sched.main_loop()):
         print(f"USER JUST GOT CHUNK {i}")

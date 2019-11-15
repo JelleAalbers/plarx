@@ -259,16 +259,79 @@ class StoredData:
     stored: ty.Dict[int, np.ndarray]
                                 # [(chunk_i, data), ...]
     seen_by_consumers: ty.Dict[TaskGenerator, int]
-                                # Last chunk seen by each of the generators
+                                # Last chunk seen by each of the tasks
                                 # that need it
     last_contiguous = -1        # Latest chunk that has arrived
                                 # for which all previous chunks have arrived
 
-    def __init__(self, dtype, wanted_by: ty.List[TaskGenerator]):
+    yielding_to_user = False       # Output must be yielded to the user
+    last_yielded_to_user = -1    # Last chunk yielded to the user
+
+    def __init__(self,
+                 dtype,
+                 wanted_by: ty.List[TaskGenerator],
+                 yield_to_user=False,):
         self.dtype = dtype
         self.stored = dict()
         self.seen_by_consumers = {tg: -1
                                   for tg in wanted_by}
+        self.yielding_to_user = yield_to_user
+
+    def add(self, data: np.ndarray, chunk_i: int):
+        self.stored[chunk_i] = data
+        if self.last_contiguous == chunk_i - 1:
+            self.last_contiguous += 1
+
+    def grab_for(self, chunk_i, tg) -> np.ndarray:
+        assert self.seen_by_consumers[tg] < chunk_i
+        self.seen_by_consumers[tg] = chunk_i
+        return self.stored[chunk_i]
+
+    def slurp_for(self, tg) -> ty.List[np.ndarray]:
+        result = []
+        while self.seen_by_consumers[tg] < self.last_contiguous:
+            result.append(self.grab_for(
+                tg=tg,
+                chunk_i=self.seen_by_consumers[tg] + 1))
+        return result
+
+    def yield_to_user(self):
+        if not self.yielding_to_user:
+            return
+
+        chunk_i = self.last_yielded_to_user + 1
+        while chunk_i in self.stored:
+            result = self.stored[chunk_i]
+            if not isinstance(result, np.ndarray):
+                raise ValueError(
+                    f"Attempt to yield a {type(result)} rather "
+                    f"than a numpy array to the user")
+            yield result  #, self.dtype, chunk_i
+            self.last_yielded_to_user = chunk_i
+            chunk_i += 1
+
+    def cleanup(self):
+        seen_by_all = min(self.seen_by_consumers.values(),
+                          default=float('inf'))
+        if self.yielding_to_user:
+            seen_by_all = min(seen_by_all, self.last_yielded_to_user)
+        elif not len(self.seen_by_consumers):
+            raise RuntimeError(f"{self.dtype} is not consumed by anyone??")
+
+        self.stored = {chunk_i: data
+                       for chunk_i, data in self.stored.items()
+                       if chunk_i > seen_by_all}
+
+    def print_status(self):
+        print(f"{self.dtype}: stored: {list(self.stored.keys())}, "
+              f"last_contiguous: {self.last_contiguous}, "
+              f"seen: {self.seen_by_consumers}")
+
+    def has_stored(self, chunk_id):
+        return chunk_id in self.stored
+
+    def n_stored(self):
+        return len(self.stored)
 
     def __repr__(self):
         return f'StoredData[{self.dtype}]'
@@ -282,17 +345,18 @@ class Scheduler:
     task_generators: ty.List[TaskGenerator]
     this_process: psutil.Process
     threshold_mb = 1000
-    yield_output: ty.Union[None, str]
 
     def __init__(self, task_generators: ty.List[TaskGenerator],
-                 yield_output=None, max_workers=5):
+                 yield_outputs=None, max_workers=5):
+        if isinstance(yield_outputs, str):
+            yield_outputs = [yield_outputs]
+
         self.max_workers = max_workers
         self.task_generators = task_generators
         self.task_generators.sort(key=lambda _tg: (_tg.priority, _tg.depth))
         self.pending_tasks = []
         self.this_process = psutil.Process(os.getpid())
 
-        self.yield_output = yield_output
         self.last_yielded_chunk = -1
 
         self.executors = dict(
@@ -309,28 +373,20 @@ class Scheduler:
                     f"{tg} has no dependencies but it is not a source?")
             for dt in tg.depends_on:
                 who_wants[dt].append(tg)
-        if self.yield_output:
-            who_wants.setdefault(self.yield_output, [])
+        for dt in yield_outputs:
+            who_wants.setdefault(dt, [])
 
         self.stored_data = {
-            dt: StoredData(dt, tgs)
+            dt: StoredData(dt, tgs, yield_to_user=dt in yield_outputs)
             for dt, tgs in who_wants.items()}
 
     def main_loop(self):
         while True:
-            self._cleanup_cache()
             self._receive_from_done_tasks()
 
-            if self.yield_output:
-                od = self.stored_data[self.yield_output]
-                while self.last_yielded_chunk + 1 in od.stored:
-                    result = od.stored[self.last_yielded_chunk + 1]
-                    if not isinstance(result, np.ndarray):
-                        raise ValueError(
-                            f"Attempt to yield a {type(result)} rather "
-                            f"than a numpy array to the user")
-                    yield result
-                    self.last_yielded_chunk += 1
+            for sd in self.stored_data.values():
+                yield from sd.yield_to_user()
+                sd.cleanup()
 
             status, task = self._get_new_task()
 
@@ -398,10 +454,7 @@ class Scheduler:
                     # TODO: consider: can be a bug but can also happen
                     print(f"Got {dtype} which nobody wants, discarding...")
                     continue
-                d = self.stored_data[dtype]
-                d.stored[task.chunk_i] = result
-                if d.last_contiguous == task.chunk_i - 1:
-                    d.last_contiguous += 1
+                self.stored_data[dtype].add(data=result, chunk_i=task.chunk_i)
 
         self.pending_tasks = still_pending
 
@@ -429,15 +482,8 @@ class Scheduler:
             if exhausted:
                 if tg.final_task_submitted:
                     continue
-                # Submit cleanup task with all inputs that were not seen
-                inputs = {}
-                for dtype in tg.depends_on:
-                    q = []
-                    sd = self.stored_data[dtype]
-                    while sd.seen_by_consumers[tg] < sd.last_contiguous:
-                        q.append(self._grab_input(
-                            dtype, tg, sd.seen_by_consumers[tg] + 1))
-                    inputs[dtype] = q
+                inputs = {dt: self.stored_data[dt].slurp_for(tg)
+                          for dt in tg.depends_on}
                 return tg.get_cleanup_task(inputs)
 
             # Check external conditions satisfied
@@ -460,7 +506,8 @@ class Scheduler:
             # We're good! Grab all inputs and submit.
             task_inputs = dict()
             for dtype, chunk_i in tg.wants_input.items():
-                task_inputs[dtype] = self._grab_input(dtype, tg, chunk_i)
+                task_inputs[dtype] = self.stored_data[dtype].grab_for(
+                    tg=tg, chunk_i=chunk_i)
 
             return tg.get_task(task_inputs)
 
@@ -492,33 +539,13 @@ class Scheduler:
         # No work to do. Maybe a pending task will still generate some though.
         return GetTaskStatus.NO_TASK, None
 
-    def _grab_input(self, dtype: str, tg: TaskGenerator, chunk_i: int):
-        self.stored_data[dtype].seen_by_consumers[tg] = chunk_i
-        return self.stored_data[dtype].stored[chunk_i]
-
     def _get_missing_input(self, tg):
         """Return a datatype for which the chunk needed by tg is not available,
         or None."""
         for dtype, chunk_id in tg.wants_input.items():
-            if chunk_id not in self.stored_data[dtype].stored:
+            if not self.stored_data[dtype].has_stored(chunk_id):
                 return dtype
         return None
-
-    def _cleanup_cache(self):
-        """Remove any data from our stored_data that has been seen
-        by all the consumers"""
-        for d in self.stored_data.values():
-
-            seen_by_all = min(d.seen_by_consumers.values(),
-                              default=float('inf'))
-            if d.dtype == self.yield_output:
-                seen_by_all = min(seen_by_all, self.last_yielded_chunk)
-            elif not len(d.seen_by_consumers):
-                raise RuntimeError(f"{d} is not consumed by anyone??")
-
-            d.stored = {chunk_i: data
-                        for chunk_i, data in d.stored.items()
-                        if chunk_i > seen_by_all}
 
     def exit_with_exception(self, exception, extra_message=''):
         print(extra_message)
@@ -531,9 +558,7 @@ class Scheduler:
                   f"\n\tall_results_arrived {tg.all_results_arrived},"
                   f"\n\tis source {tg.is_source}")
         for dt, d in self.stored_data.items():
-            print(f"{dt}: stored: {list(d.stored.keys())}, "
-                  f"last_contiguous: {d.last_contiguous}, "
-                  f"seen: {d.seen_by_consumers}")
+            d.print_status()
         for tg in self.task_generators:
             if not tg.final_task_submitted:
                 try:
@@ -557,6 +582,6 @@ class Scheduler:
             if not tg.provides or not tg.all_results_arrived:
                 continue
             for p in tg.provides:
-                if not len(self.stored_data[p].stored):
+                if not self.stored_data[p].n_stored():
                     exhausted.append(p)
         return exhausted
