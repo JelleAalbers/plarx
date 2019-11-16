@@ -1,3 +1,5 @@
+import random
+import string
 
 
 def exporter(export_self=False):
@@ -13,3 +15,7 @@ def exporter(export_self=False):
         return obj
 
     return decorator, all_
+
+
+def random_str(n):
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))

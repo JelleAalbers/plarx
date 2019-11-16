@@ -6,15 +6,16 @@ import os
 from random import random
 import time
 import typing as ty
+from types import MethodType
 
 import psutil
 import numpy as np
 
-from .utils import exporter
+from .utils import exporter, random_str
 export, __all__ = exporter()
 
 
-class GetTaskStatus(Enum):
+class Signals(Enum):
     NO_TASK = 0
     GOT_TASK = 1
     WAIT_EXTERNAL = 3
@@ -23,7 +24,7 @@ class GetTaskStatus(Enum):
 class Task(ty.NamedTuple):
     """Task object, tracking a future submitted to a pool"""
 
-    # If true, mark TaskGenerator as finished on completion
+    # If true, mark Job as finished on completion
     is_final: bool
 
     # Generator that made the task.
@@ -48,31 +49,28 @@ class CannotSubmitNewTask(Exception):
 
 
 @export
-class TaskGenerator:
+class Job:
     provides: ty.Tuple[str] = tuple()     # Produced data types
     depends_on: ty.Tuple[str] = tuple()   # Input data types
+
+    submit_to = 'thread'        # thread, process, or user
+    parallel = True             # Can we start more than one task at a time?
+    changing_inputs = False     # If True, task_function returns
+                                # (result, inputs_wanted_next_time)
+                                # Cannot parallelize.
+    priority = 0                # 0 = saver/target, 1 = source, 2 = other
+
     wants_input: ty.Dict[str, int]  # [(dtype, chunk_i), ...] of inputs
                                     # needed to make progress
     seen_input: ty.Dict[str, int]   # [(dtype, chunk_i), ...] of inputs
                                     # already seen
 
-    is_source = False           # True if loader/producer of data without deps
-    submit_to = 'thread'        # thread, process, or user
-    parallel = False            # Can we start more than one task at a time?
-    changing_inputs = False     # If True, task_function returns
-                                # (result, inputs_wanted_next_time)
-                                # Cannot parallelize.
-
-    priority = 0                # 0 = saver/target, 1 = source, 2 = other
     depth = 0                   # Dependency hops to final target
 
     pending_is: set             # Set of pending task numbers
     last_submitted_i = -1       # Number of last emitted task
     _highest_done_i = -1        # Highest completed task number, NOT continuous!
     final_task_i = float('inf')   # Number of final task (if known)
-
-    input_cache: ty.Dict[str, np.ndarray]
-                                # Inputs we could not yet pass to computation
 
     # "Finished" variables. Note there are two...
     final_task_submitted = False
@@ -85,9 +83,41 @@ class TaskGenerator:
         else:
             return self._highest_done_i
 
+    @property
+    def is_source(self):
+        return not len(self.depends_on)
+
+    # TODO: how to keep defaults consistent here?
+    @classmethod
+    def from_function(
+            cls,
+            task: ty.Callable,
+            cleanup: ty.Callable=None,
+            provides=tuple(),
+            depends_on=tuple(),
+            submit_to='thread',
+            parallel=True,
+            changing_inputs=False):
+        """Construct job from task function
+        :param task: Task function. See Job.task
+        :param cleanup: Cleanup function. See Job.cleanup
+
+        Other arguments are as in first lines of Job code (TODO:document)
+        """
+        if not len(provides) and len(depends_on):
+            raise ValueError("Job must provide or depend on something")
+        self = type('Job' + random_str(10),
+                    (Job,),
+                    dict(provides=provides, depends_on=depends_on,
+                        submit_to=submit_to, parallel=parallel,
+                        changing_inputs=changing_inputs))
+        self.task = MethodType(task, self)
+        if self.cleanup is not None:
+            self.cleanup = MethodType(cleanup, self)
+
     def __init__(self):
         if self.changing_inputs and self.parallel:
-            raise RuntimeError("Cannot parallelize a TaskGenerator with "
+            raise RuntimeError("Cannot parallelize a Job with "
                                "indirect input delivery.")
         if self.is_source and len(self.depends_on):
             raise RuntimeError("A source cannot depend on any data type")
@@ -129,7 +159,7 @@ class TaskGenerator:
 
         for k in inputs:
             self.seen_input[k] += 1
-        content = partial(self.task_function, chunk_i=task_i, **inputs)
+        content = partial(self.task, chunk_i=task_i, **inputs)
 
         if not self.changing_inputs:
             # Request the next set of inputs
@@ -138,7 +168,7 @@ class TaskGenerator:
 
         return self._submit_task(content, task_i, is_final=False)
 
-    def _submit_task(self, content, task_i, is_final) -> (GetTaskStatus, Task):
+    def _submit_task(self, content, task_i, is_final) -> (Signals, Task):
         future = self.executors[self.submit_to].submit(content)
         self.last_submitted_i += 1
         return Task(
@@ -224,20 +254,13 @@ class TaskGenerator:
             assert k in result, \
                 f"{task} failed to provide needed output {k}"
 
-    # Function to override
+    ##
+    # Functions to override
+    ##
 
-    def task_function(self, chunk_i: int, **kwargs) \
+    def task(self, chunk_i: int, **kwargs) \
             -> ty.Dict[str, np.ndarray]:
         raise NotImplementedError
-
-    def external_inputs_exhausted(self):
-        """For sources, return whether external inputs exhausted"""
-        return False
-
-    def external_input_ready(self):
-        """For sources, return whether the next external input
-         (i.e. self.chunk_id + 1) is ready"""
-        return True
 
     def cleanup(self, chunk_i: int, exception=None, **inputs) \
             -> ty.Union[None, ty.Dict[str, np.ndarray]]:
@@ -254,12 +277,21 @@ class TaskGenerator:
         """
         pass
 
+    def external_inputs_exhausted(self):
+        """For sources, return whether external inputs exhausted"""
+        return False
+
+    def external_input_ready(self):
+        """For sources, return whether the next external input
+         (i.e. self.chunk_id + 1) is ready"""
+        return True
+
 
 class StoredData:
     dtype: str                  # Name of data type
     stored: ty.Dict[int, np.ndarray]
                                 # [(chunk_i, data), ...]
-    seen_by_consumers: ty.Dict[TaskGenerator, int]
+    seen_by_consumers: ty.Dict[Job, int]
                                 # Last chunk seen by each of the tasks
                                 # that need it
     last_contiguous = -1        # Latest chunk that has arrived
@@ -270,8 +302,8 @@ class StoredData:
 
     def __init__(self,
                  dtype,
-                 wanted_by: ty.List[TaskGenerator],
-                 yield_to_user=False,):
+                 wanted_by: ty.List[Job],
+                 yield_to_user=False, ):
         self.dtype = dtype
         self.stored = dict()
         self.seen_by_consumers = {tg: -1
@@ -339,22 +371,26 @@ class StoredData:
 
 
 @export
-class Scheduler:
+class Stream:
     pending_tasks: ty.List[Task]
     stored_data: ty.Dict[str, StoredData]  # {dtypename: StoredData}
     final_target: str
-    task_generators: ty.List[TaskGenerator]
+    task_generators: ty.List[Job]
     this_process: psutil.Process
     threshold_mb = 1000
 
-    def __init__(self, task_generators: ty.List[TaskGenerator],
+    def __init__(self, task_generators: ty.List[Job],
                  yield_outputs=None, max_workers=5):
         if isinstance(yield_outputs, str):
             yield_outputs = [yield_outputs]
 
         self.max_workers = max_workers
         self.task_generators = task_generators
-        self.task_generators.sort(key=lambda _tg: (_tg.priority, _tg.depth))
+
+        def get_priority(tg: Job):
+            return tg.priority, tg.depth
+        self.task_generators.sort(key=get_priority)
+
         self.pending_tasks = []
         self.this_process = psutil.Process(os.getpid())
 
@@ -391,30 +427,26 @@ class Scheduler:
 
             status, task = self._get_new_task()
 
-            if status is GetTaskStatus.GOT_TASK:
+            if status is Signals.GOT_TASK:
                 self.pending_tasks += [task]
                 if len(self.pending_tasks) < self.max_workers:
                     continue
                 self.wait_until_task_done()
 
-            elif status is GetTaskStatus.NO_TASK:
-                # No work right now.
+            elif status is Signals.NO_TASK:
                 if not self.pending_tasks:
-                    self.final_checks()
-                    break  # All done. We win!
+                    self._exit_normally()
+                    return
                 self.wait_until_task_done()
                 continue
 
-            elif status is GetTaskStatus.WAIT_EXTERNAL:
+            elif status is Signals.WAIT_EXTERNAL:
                 # TODO: emit who is waiting
                 self._emit_status(f"Waiting on external condition")
                 time.sleep(5)
                 continue
 
-        for exc in self.executors.values():
-            exc.shutdown()
-
-    def final_checks(self):
+    def _exit_normally(self):
         if any([not tg.all_results_arrived
                 for tg in self.task_generators]):
             self.exit_with_exception(RuntimeError(
@@ -423,6 +455,9 @@ class Scheduler:
         if any([sd.n_stored() for sd in self.stored_data.values()]):
             self.exit_with_exception(RuntimeError(
                 "End but data is still stored!"))
+
+        for exc in self.executors.values():
+            exc.shutdown()
 
     def wait_until_task_done(self):
         while True:
@@ -463,7 +498,7 @@ class Scheduler:
 
     def _get_new_task(self):
         """Return a new task, or None, if it is wiser or necessary to wait"""
-        external_waits = []    # TaskGenerators waiting for external conditions
+        external_waits = []    # Jobs waiting for external conditions
         sources = []           # Sources we could load more data from
         requests_for = defaultdict(int)  # Requests for particular inputs
         exhausted_dtypes = self._get_exhausted()
@@ -487,7 +522,7 @@ class Scheduler:
                     continue
                 inputs = {dt: self.stored_data[dt].slurp_for(tg)
                           for dt in tg.depends_on}
-                return GetTaskStatus.GOT_TASK, tg.get_cleanup_task(inputs)
+                return Signals.GOT_TASK, tg.get_cleanup_task(inputs)
 
             # Check external conditions satisfied
             if (not tg.external_input_ready()
@@ -516,7 +551,7 @@ class Scheduler:
                 task_inputs[dtype] = self.stored_data[dtype].grab_for(
                     tg=tg, chunk_i=chunk_i)
 
-            return GetTaskStatus.GOT_TASK, tg.get_task(task_inputs)
+            return Signals.GOT_TASK, tg.get_task(task_inputs)
 
         if sources:
             # No computation tasks to do, but we could load new data
@@ -525,7 +560,7 @@ class Scheduler:
                 # ... Let's not though; instead wait for current tasks.
                 # (We could perhaps also wait for an external condition
                 # but in all likelihood a task will complete soon enough)
-                return GetTaskStatus.NO_TASK, None
+                return Signals.NO_TASK, None
             # Load data for the source that is blocking the most tasks
             # Jitter it a bit for better performance on ties..
             # TODO: There is a better way, but I'm too lazy now
@@ -533,18 +568,18 @@ class Scheduler:
                                             for dt in s.provides]) + random())
                                    for s in sources]
             s, _ = max(requests_for_source, key=lambda q: q[1])
-            return GetTaskStatus.GOT_TASK, s.get_task(None)
+            return Signals.GOT_TASK, s.get_task(None)
 
         if external_waits:
             if len(self.pending_tasks):
                 # Assume an existing task will complete before the wait time.
                 # TODO: Good idea? Maybe make configurable?
-                return GetTaskStatus.NO_TASK, None
+                return Signals.NO_TASK, None
             else:
-                return GetTaskStatus.WAIT_EXTERNAL, None
+                return Signals.WAIT_EXTERNAL, None
 
         # No work to do. Maybe a pending task will still generate some though.
-        return GetTaskStatus.NO_TASK, None
+        return Signals.NO_TASK, None
 
     def _emit_status(self, msg):
         print(msg)

@@ -3,7 +3,7 @@ import numpy as np
 import plarx
 
 
-class BasicSource(plarx.TaskGenerator):
+class BasicSource(plarx.Job):
     is_source = True
     provides = ('widgets',)
 
@@ -17,7 +17,7 @@ class BasicSource(plarx.TaskGenerator):
         # print(self.chunk_i, "external exhausted check", self.chunk_i == self.n_chunks - 1)
         return self.last_submitted_i + 1 == self.n_chunks
 
-    def task_function(self, chunk_i, **kwargs):
+    def task(self, chunk_i, **kwargs):
         if len(kwargs):
             raise ValueError(f"Got spurious kwargs {kwargs}")
         if chunk_i >= self.n_chunks:
@@ -28,7 +28,7 @@ class BasicSource(plarx.TaskGenerator):
 
 def test_source():
     """Single source, no processing"""
-    sched = plarx.Scheduler(
+    sched = plarx.Stream(
         [BasicSource()],
         yield_outputs='widgets')
     i = 0
@@ -39,11 +39,11 @@ def test_source():
     assert i == 9
 
 
-class BasicProc(plarx.TaskGenerator):
+class BasicProc(plarx.Job):
     provides = ('doodads',)
     depends_on = ('widgets',)
 
-    def task_function(self, chunk_i, is_final=False, **kwargs):
+    def task(self, chunk_i, is_final=False, **kwargs):
         if is_final:
             return None
         for k, v in kwargs.items():
@@ -55,7 +55,7 @@ class BasicProc(plarx.TaskGenerator):
 
 def test_process():
     """Source + processing"""
-    sched = plarx.Scheduler(
+    sched = plarx.Stream(
         [BasicSource(), BasicProc()],
         yield_outputs='doodads')
     i = 0
@@ -70,19 +70,20 @@ class SecondSource(BasicSource):
     n_chunks = 4
     provides = ('thingies',)
 
-    def task_function(self, chunk_i, is_final=False, **kwargs):
+    def task(self, chunk_i, is_final=False, **kwargs):
         print(f"YIELDING THINGIES # {chunk_i}")
         return dict(thingies=np.ones(42, dtype=np.float32) * chunk_i)
 
 
-class FunnyCombination(plarx.TaskGenerator):
+class FunnyCombination(plarx.Job):
     depends_on = ('doodads', 'thingies')
     provides = ('gizmos',)
     changing_inputs = True
+    parallel = False
 
     toggle = False  # Will be switched to true on first call
 
-    def task_function(self, chunk_i, is_final=False, **kwargs):
+    def task(self, chunk_i, is_final=False, **kwargs):
         for k, v in kwargs.items():
             assert isinstance(v, np.ndarray), f"Got a {type(v)} rather than a numpy array for {k}"
         bla = {k: kwargs[k][0] for k in kwargs}
@@ -122,7 +123,7 @@ class FunnyCombination(plarx.TaskGenerator):
 
 def test_complex():
     """Multiple dependencies, sources, and wants_input switching"""
-    sched = plarx.Scheduler(
+    sched = plarx.Stream(
         [BasicSource(), BasicProc(), SecondSource(), FunnyCombination()],
         yield_outputs='gizmos')
     i = 0
