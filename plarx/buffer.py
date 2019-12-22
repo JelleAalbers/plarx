@@ -1,15 +1,14 @@
 import typing as ty
-import numpy as np
 
+import plarx
 from .common import exporter
 export, __all__ = exporter()
 
-import plarx
 
 @export
 class Buffer:
-    _dtype: str                 # Name of data type
-    _stored: ty.Dict[int, np.ndarray]
+    name: str                  # Name of data type
+    _stored: ty.Dict[int, ty.Any]
                                 # [(chunk_i, data), ...]
     _seen_by_consumers: ty.Dict[plarx.Job, int]
                                 # Last chunk seen by each of the tasks
@@ -21,29 +20,29 @@ class Buffer:
     _last_yielded_to_user = -1    # Last chunk yielded to the user
 
     def __init__(self,
-                 dtype,
+                 name,
                  wanted_by: ty.List[plarx.Job],
                  yield_to_user=False, ):
         """Buffer of stored data of one type.
 
-        :param dtype: Name of the data type to be stored
+        :param name: Name of the data type to be stored
         :param wanted_by: List of jobs that want this data type
         :param yield_to_user: if True (default False), this data type
         will be yielded to the user.
         """
-        self._dtype = dtype
+        self.name = name
         self._stored = dict()
         self._seen_by_consumers = {tg: -1
                                    for tg in wanted_by}
         self._yielding_to_user = yield_to_user
 
-    def add(self, data: np.ndarray, chunk_i: int):
+    def add(self, data, chunk_i: int):
         """Add a new chunk of data to the buffer"""
         self._stored[chunk_i] = data
         if self._last_contiguous == chunk_i - 1:
             self._last_contiguous += 1
 
-    def grab_for(self, chunk_i, job) -> np.ndarray:
+    def grab_for(self, chunk_i, job):
         """Return chunk_i for use in job"""
         assert self._seen_by_consumers[job] < chunk_i, \
             f"Cannot get {chunk_i} for {job}, " \
@@ -54,7 +53,7 @@ class Buffer:
         self._seen_by_consumers[job] = chunk_i
         return self._stored[chunk_i]
 
-    def slurp_for(self, job) -> ty.List[np.ndarray]:
+    def slurp_for(self, job) -> ty.List:
         """Return list of all buffered chunks not yet seen by job"""
         result = []
         while self._seen_by_consumers[job] < self._last_contiguous:
@@ -71,11 +70,7 @@ class Buffer:
         chunk_i = self._last_yielded_to_user + 1
         while chunk_i in self._stored:
             result = self._stored[chunk_i]
-            if not isinstance(result, np.ndarray):
-                raise ValueError(
-                    f"Attempt to yield a {type(result)} rather "
-                    f"than a numpy array to the user")
-            yield result  #, self.dtype, chunk_i
+            yield result
             self._last_yielded_to_user = chunk_i
             chunk_i += 1
 
@@ -88,14 +83,14 @@ class Buffer:
         if self._yielding_to_user:
             seen_by_all = min(seen_by_all, self._last_yielded_to_user)
         elif not len(self._seen_by_consumers):
-            raise RuntimeError(f"{self._dtype} is not consumed by anyone??")
+            raise RuntimeError(f"{self.name} is not consumed by anyone??")
 
         self._stored = {chunk_i: data
                         for chunk_i, data in self._stored.items()
                         if chunk_i > seen_by_all}
 
     def print_status(self):
-        print(f"{self._dtype}: stored: {list(self._stored.keys())}, "
+        print(f"{self.name}: stored: {list(self._stored.keys())}, "
               f"last_contiguous: {self._last_contiguous}, "
               f"seen: {self._seen_by_consumers}")
 
@@ -106,4 +101,4 @@ class Buffer:
         return len(self._stored)
 
     def __repr__(self):
-        return f'Buffer[{self._dtype}]'
+        return f'Buffer[{self.name}]'

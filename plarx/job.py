@@ -1,14 +1,12 @@
-import concurrent.futures as cf
+import concurrent.futures
 from functools import partial
 import typing as ty
 from types import MethodType
 
-import numpy as np
+import plarx
 
 from .common import exporter
 export, __all__ = exporter()
-
-import plarx
 
 
 class CannotSubmitNewTask(Exception):
@@ -33,7 +31,7 @@ class Task(ty.NamedTuple):
     #
     # For tasks that are placeholders for data to be returned to the user,
     # future directly stores the result.
-    future: ty.Union[cf.Future, np.ndarray]
+    future: concurrent.futures.Future
 
     def __repr__(self):
         return f"Task[{self.job}:{self.chunk_i}]"
@@ -139,9 +137,6 @@ class Job:
         # Validate inputs
         # Inputs must be dicts of numpy arrays
         for k in inputs:
-            if not isinstance(inputs[k], np.ndarray):
-                raise RuntimeError(f"Got {type(inputs[k])} instead of np"
-                                   f"array as input {k} given to {self}")
             if k not in self.wants_input:
                 raise RuntimeError(f"Unwanted input {k} given to {self}")
         for k in self.wants_input:
@@ -250,11 +245,11 @@ class Job:
     ##
 
     def task(self, chunk_i: int, **kwargs) \
-            -> ty.Dict[str, np.ndarray]:
+            -> ty.Dict[str, ty.Any]:
         raise NotImplementedError
 
     def cleanup(self, chunk_i: int, exception=None, **inputs) \
-            -> ty.Union[None, ty.Dict[str, np.ndarray]]:
+            -> ty.Union[None, ty.Dict[str, ty.Any]]:
         """Execute final cleanup, e.g. closing of files.
 
         :param chunk_i: Task number, or -1 in exceptional termination.

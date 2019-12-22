@@ -16,8 +16,8 @@ def exporter(export_self=False):
 
     return decorator, all_
 
-export, __all__ = exporter(True)
 
+export, __all__ = exporter(True)
 
 
 @export
