@@ -16,6 +16,10 @@ def exporter(export_self=False):
 
     return decorator, all_
 
+export, __all__ = exporter(True)
 
+
+
+@export
 def random_str(n):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
